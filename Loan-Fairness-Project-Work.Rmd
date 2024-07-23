@@ -1,0 +1,1422 @@
+---
+title: "Loan Fairness Project Work"
+author: "Gray Goss"
+date: "2024-03-11"
+output: pdf_document
+---
+
+## Libraries
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(rvest)
+library(car)
+library(randomForest)
+library(caret)
+library(tidyr)
+library(stats)
+```
+
+
+
+## Data Loading
+```{r}
+#df <- read.csv("C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\cleaned_powerbi_data_csv.csv")
+
+df_full_1 <- read.csv("path_to_csv_file.csv")
+```
+
+## Cleaning Initial Dataset
+```{r}
+df_full_1 <- subset(df_full_1, loan_type != 4)
+df_full_1 <- df_full_1[df_full_1$action_taken %in% c(1, 2, 3), ]
+
+selected_columns <- c("lei", "state_code", "action_taken", "loan_type", "loan_amount", "interest_rate", "total_loan_costs", "loan_term", "property_value", "income", "debt_to_income_ratio", "applicant_ethnicity_1", "derived_sex", "applicant_race_1", "applicant_race_2", "applicant_sex", "applicant_age")
+
+df_full <- df_full_1[, selected_columns]
+
+df_full <- df_full %>% mutate_all(~na_if(trimws(.), "")) #Ensures all blank cells are null and not whitespace
+
+df_full
+```
+
+## Column Cleaning, Column Creation, and Pulling the Firm Names from the Web 
+```{r}
+df_full$action_taken <- as.integer(df_full$action_taken)
+df_full$loan_type <- as.integer(df_full$loan_type)
+df_full$loan_amount <- as.numeric(df_full$loan_amount)
+df_full$interest_rate <- as.numeric(df_full$interest_rate)
+df_full$total_loan_costs <- as.numeric(df_full$total_loan_costs)
+df_full$loan_term <- as.integer(df_full$loan_term)
+df_full$property_value <- as.integer(df_full$property_value)
+df_full$income <- as.integer(df_full$income)
+df_full$debt_to_income_ratio <- as.numeric(df_full$debt_to_income_ratio)
+df_full$applicant_ethnicity_1 <- as.integer(df_full$applicant_ethnicity_1)
+df_full$applicant_race_1 <- as.integer(df_full$applicant_race_1)
+df_full$applicant_race_2 <- as.integer(df_full$applicant_race_2)
+df_full$applicant_sex <- as.integer(df_full$applicant_sex)
+
+df_full$coapplicant <- ifelse(is.na(df_full$derived_sex), NA, ifelse(df_full$derived_sex == "Joint", "Yes", "No"))
+df_full$sex <- ifelse(df_full$applicant_sex == 1, "Male", ifelse(df_full$applicant_sex == 2, "Female", NA))
+
+df_full$loan_to_income <- df_full$loan_amount / (df_full$income*1000)
+
+df_full$income_cat <- ifelse(is.na(df_full$income), NA, 
+                             cut(df_full$income, breaks = c(-Inf, 50, 100, 200, 300, Inf),
+                                 labels = c("0-50k", "050k-100k", "100k-200k", "200k-300k", "300k+")))
+
+df_full$loan_acceptance <- ifelse(df_full$action_taken %in% c(1, 2), 1, ifelse(df_full$action_taken == 3, 0, NA))
+
+df_full$apr <- ((((df_full$interest_rate / 100) * (df_full$loan_term / 12)) + (df_full$total_loan_costs / df_full$loan_amount)) * (12 / df_full$loan_term)) * 100
+
+df_full <- df_full %>% 
+  mutate(applicant_age = ifelse(applicant_age == ">74", "74+", applicant_age))
+
+df_full <- df_full %>%
+  mutate(loan_type_desc = case_when(
+    loan_type == 1 ~ "Conventional",
+    loan_type == 2 ~ "FHA-insured",
+    loan_type == 3 ~ "VA-guaranteed",
+    loan_type == 4 ~ "FSA/RHS",
+    TRUE ~ NA_character_  
+  ))
+
+df_full <- df_full %>%
+  mutate(race_ethnicity = case_when(
+    applicant_race_2 %in% c(1,2,3,4,5) ~ "2+ Races",
+
+    applicant_race_1 %in% c(1, 4) ~ "Other",
+    applicant_race_1 == 2 ~ "Asian",
+    applicant_race_1 == 3 ~ "Black",
+    applicant_ethnicity_1 == 1 ~ "Hispanic",
+    applicant_race_1 == 5 ~ "White",
+    TRUE ~ NA_character_  
+  ))
+
+df_full$loan_type_conventional <- ifelse(df_full$loan_type_desc == "Conventional", 1, 0)
+df_full$loan_type_FHA_insured <- ifelse(df_full$loan_type_desc == "FHA-insured", 1, 0)
+
+get_firm_name <- function(lei) {
+  url <- paste0("https://www.lei-lookup.com/record/", lei, "/")
+  
+  page <- read_html(url)
+  
+  firm_name <- page %>% html_nodes('h1') %>% html_text()
+  
+  return(firm_name)
+}
+
+unique_leis <- unique(df_full$lei)
+
+firm_names <- sapply(unique_leis, get_firm_name)
+
+lei_firm_pairs <- setNames(firm_names, unique_leis)
+
+df_full$firm <- lei_firm_pairs[df_full$lei]
+
+columns_to_remove <- c("action_taken", "loan_type", "interest_rate", "total_loan_costs", "debt_to_income_ratio", "applicant_ethnicity_1", "applicant_race_1", "applicant_race_2", "derived_sex", "applicant_sex")
+
+df_all <- df_full[, setdiff(names(df_full), columns_to_remove)]
+
+df_all$high_apr <- ifelse(df_all$apr > 3.72, 1, ifelse(df_all$apr <= 3.72, 0, NA))
+df_all$high_apr <- as.factor(df_all$high_apr)
+
+df_all
+```
+
+## Checkpoint
+```{r}
+write.csv(df_all, "path_to_df_all_csv.csv")
+```
+
+## Using Random Forest to Predict Loan Acceptance, Further Dataset Cleaning
+```{r}
+df_all_imported_1 <- read.csv("path_to_df_all_csv.csv")
+
+set.seed(123)
+
+df_all_imported_1$coap_binary <- ifelse(df_all_imported_1$coapplicant == "Yes", 1, ifelse(df_all_imported_1$coapplicant == "No", 0, NA))
+df_all_imported_1$loan_acceptance <- as.factor(df_all_imported_1$loan_acceptance) 
+
+predictors <- df_all_imported_1[, c('loan_acceptance', 'loan_amount', 'income', 'coap_binary', 'property_value', 'loan_type_conventional')]
+
+complete_rows <- complete.cases(predictors)
+
+#df_tree <- df_all[complete_rows, ]
+predictors <- predictors[complete_rows, ]
+
+#vif_results <- vif(lm(high_apr ~ ., data = predictors)) 
+
+n_rows <- nrow(predictors)
+train_size <- round(0.2 * n_rows)
+train_indices <- sample(1:n_rows, train_size, replace = FALSE)
+train_data <- predictors[train_indices, ]
+
+rf_model <- randomForest(loan_acceptance ~ ., data = train_data, ntree = 20, importance = TRUE, method = "class")
+
+predicted_values <- predict(rf_model, newdata = df_all_imported_1)
+
+predicted_probs <- predict(rf_model, newdata = df_all_imported_1, type = "prob")
+
+df_all_imported_1$predicted_loan_acceptance_new <- predicted_values
+
+df_all_imported_1$prob_0_new <- predicted_probs[, "0"]
+df_all_imported_1$prob_1_new <- predicted_probs[, "1"]
+
+varImpPlot(rf_model)
+
+df_all_imported <- df_all_imported_1 %>%
+  mutate(income_class = case_when(
+    income_cat == 1 ~ "0-50k",
+    income_cat == 2 ~ "050k-100k",
+    income_cat == 3 ~ "100k-200k",
+    income_cat == 4 ~ "200k-300k",
+    income_cat == 5 ~ "300k+",
+    TRUE ~ NA_character_
+  ))
+
+
+df_all_imported <- df_all_imported %>%
+  mutate(income = income * 1000)
+
+df_all_imported$firm <- gsub("\\s*,.*", "", df_all_imported$firm)
+df_all_imported$firm <- trimws(df_all_imported$firm)
+
+df_all_imported$prob_1_clean <- ifelse(df_all_imported$prob_1_new >= 0.95,
+                                      0.5 + ((0.5 / (1 - 0.95 )) * (df_all_imported$prob_1_new - 0.95 )),
+                                      0.5 + ((0.5 / 0.95 ) * (df_all_imported$prob_1_new - 0.95 )))
+
+df_all_imported$prob_0_clean <- 1 - df_all_imported$prob_1_clean
+
+df_all_imported <- df_all_imported %>%
+  select(-loan_type_FHA_insured, -loan_type_conventional, -loan_to_income, -X, -income_cat, -high_apr, -lei,  -prob_0, -prob_1, -prob_1_new, -prob_0_new)
+
+df_all_imported$predicted_loan_acceptance <- ifelse(df_all_imported$prob_1_clean >= 0.5, 1, 0)
+
+df_all_imported
+```
+
+## Checkpoint 2
+```{r}
+write.csv(df_all_imported, "path_to_full_data_pt2.csv")
+```
+
+## Only Keeping Rows without any Null Values
+```{r}
+complete_rows <- complete.cases(df_all_imported[, c("loan_acceptance", "predicted_loan_acceptance", "firm", "race_ethnicity", "applicant_age", "sex")])
+df_all_imported_2 <- df_all_imported[complete_rows, ]
+
+df_full_analysis <- df_all_imported[, c("loan_acceptance", "predicted_loan_acceptance", "firm", "race_ethnicity", "applicant_age", "sex")]
+
+df_full_analysis <- na.omit(df_full_analysis)
+
+rownames(df_full_analysis) <- NULL
+
+df_full_analysis
+```
+
+## Calculating Firm Loan Origination Rates
+```{r}
+df_full_analysis$predicted_loan_acceptance <- as.integer(as.factor(df_full_analysis$predicted_loan_acceptance)) -1
+df_full_analysis$loan_acceptance <- as.integer(as.factor(df_full_analysis$loan_acceptance)) -1
+
+firm_counts <- table(df_full_analysis$firm)
+
+firm_acceptance_rates <- tapply(df_full_analysis$loan_acceptance, df_full_analysis$firm, function(x) mean(x))
+
+firm_metrics <- data.frame(
+  firm = names(firm_counts),
+  loan_applications = as.numeric(firm_counts),
+  acceptance_rate = firm_acceptance_rates
+)
+```
+
+## Selecting 1000 Largest Firms
+```{r}
+df_to_merge <- df_all_imported_2 %>%
+  group_by(firm) %>%
+  filter(n() >= 1000)
+
+filtered_df_1000 <- df_full_analysis %>%
+  group_by(firm) %>%
+  filter(n() >= 1000)
+
+#filtered_df_1 <- df_full_analysis %>%
+#  group_by(firm) %>%
+#  filter(n() >= 1)
+
+firm_counts_filtered <- df_full_analysis %>%
+  count(firm) %>%
+  filter(n >= 1000)
+
+#filtered_df_1
+
+firm_metrics <- firm_metrics %>%
+  semi_join(firm_counts_filtered, by = "firm")
+
+firm_metrics
+```
+
+## Calculating Origination rates, TPRs and FPRs for each Firm by Each Demographic Class 
+```{r}
+filtered_df_1000$predicted_loan_acceptance <- as.integer(as.factor(filtered_df_1000$predicted_loan_acceptance)) -1
+filtered_df_1000$loan_acceptance <- as.integer(as.factor(filtered_df_1000$loan_acceptance)) -1
+
+race_grouped <- filtered_df_1000 %>%
+  group_by(firm, race_ethnicity)
+
+race_metrics <- race_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 1) / sum(predicted_loan_acceptance == 1),
+    false_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 0) / sum(predicted_loan_acceptance == 0)
+  )
+
+sex_grouped <- filtered_df_1000 %>%
+  group_by(firm, sex)
+
+sex_metrics <- sex_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 1) / sum(predicted_loan_acceptance == 1),
+    false_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 0) / sum(predicted_loan_acceptance == 0)
+  )
+
+age_grouped <- filtered_df_1000 %>%
+  group_by(firm, applicant_age)
+
+age_metrics <- age_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 1) / sum(predicted_loan_acceptance == 1),
+    false_positive_rate = sum(loan_acceptance == 1 & predicted_loan_acceptance == 0) / sum(predicted_loan_acceptance == 0)
+  )
+
+race_metrics
+sex_metrics
+age_metrics
+
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and loan_applications
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and acceptance_rate
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and true_positive_rate
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and false_positive_rate
+
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and loan_applications
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and acceptance_rate
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and true_positive_rate
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and false_positive_rate
+
+# sex_metrics: applicant_sex_cleaned (Female, Male) and loan_applications
+# sex_metrics: applicant_sex_cleaned (Female, Male) and acceptance_rate
+# sex_metrics: applicant_sex_cleaned (Female, Male) and true_positive_rate
+# sex_metrics: applicant_sex_cleaned (Female, Male) and false_positive_rate
+```
+
+
+## Calculating the Differences in Max and Min Origination Rates, TPRs and FPRs of each Firm by each Demographic Class
+```{r}
+filtered_df_1000$predicted_loan_acceptance <- as.integer(as.factor(filtered_df_1000$predicted_loan_acceptance)) -1
+filtered_df_1000$loan_acceptance <- as.integer(as.factor(filtered_df_1000$loan_acceptance)) -1
+
+calculate_metrics <- function(df, group_col) {
+  grouped_df <- df %>%
+    group_by(firm, {{group_col}})
+
+  demographic_metrics <- grouped_df %>%
+    summarise(
+      acceptance_rate = mean(loan_acceptance),
+      TP = sum(predicted_loan_acceptance == 1 & loan_acceptance == 1),
+      FN = sum(predicted_loan_acceptance == 1 & loan_acceptance == 0),
+
+      true_positive_rate = TP / (TP + FN),
+      
+      FP = sum(predicted_loan_acceptance == 0 & loan_acceptance == 1),
+      TN = sum(predicted_loan_acceptance == 0 & loan_acceptance == 0),
+
+      false_positive_rate = FP / (FP + TN),
+      total_loans = TP + FN + FP + TN
+    )
+  
+  return(demographic_metrics)
+}
+
+race_metrics_2 <- calculate_metrics(filtered_df_1000, race_ethnicity)
+
+sex_metrics_2 <- calculate_metrics(filtered_df_1000, sex)
+
+age_metrics_2 <- calculate_metrics(filtered_df_1000, applicant_age)
+
+race_metrics_2 <- race_metrics_2 %>%
+  filter(total_loans >= 68)
+
+sex_metrics_2 <- sex_metrics_2 %>%
+  filter(total_loans >= 68)
+
+age_metrics_2 <- age_metrics_2 %>%
+  filter(total_loans >= 68)
+
+calculate_differences <- function(metrics) {
+  metrics_subset <- metrics[, -c(1,2,10)]
+  
+  max_values <- sapply(metrics_subset, function(x) tapply(x, metrics$firm, max, na.rm = TRUE))
+  min_values <- sapply(metrics_subset, function(x) tapply(x, metrics$firm, min, na.rm = TRUE))
+  
+  max_df <- as.data.frame(max_values)
+  min_df <- as.data.frame(min_values)
+  
+  differences <- max_df - min_df
+  ratios <- min_df / max_df
+  
+  colnames(ratios) <- paste0(colnames(ratios), ".x")
+  
+  df_final <- cbind(differences, ratios) 
+  return(df_final)
+}
+
+race_differences <- calculate_differences(race_metrics_2)
+sex_differences <- calculate_differences(sex_metrics_2)
+age_differences <- calculate_differences(age_metrics_2)
+
+colnames(race_differences)[colnames(race_differences) == "acceptance_rate"] <- "race_acceptance_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "acceptance_rate"] <- "sex_acceptance_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "acceptance_rate"] <- "age_acceptance_rate_diff"
+
+colnames(race_differences)[colnames(race_differences) == "true_positive_rate"] <- "race_true_positive_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "true_positive_rate"] <- "sex_true_positive_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "true_positive_rate"] <- "age_true_positive_rate_diff"
+
+colnames(race_differences)[colnames(race_differences) == "false_positive_rate"] <- "race_false_positive_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "false_positive_rate"] <- "sex_false_positive_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "false_positive_rate"] <- "age_false_positive_rate_diff"
+
+colnames(race_differences)[colnames(race_differences) == "acceptance_rate.x"] <- "race_AIR"
+colnames(sex_differences)[colnames(sex_differences) == "acceptance_rate.x"] <- "sex_AIR"
+colnames(age_differences)[colnames(age_differences) == "acceptance_rate.x"] <- "age_AIR"
+
+race_differences$firm <- rownames(race_differences)
+sex_differences$firm <- rownames(sex_differences)
+age_differences$firm <- rownames(age_differences)
+
+race_differences <- race_differences %>%
+  select(-TP, -FP, -TN, -FN, -TP.x, -FP.x, -TN.x, -FN.x, -true_positive_rate.x, -false_positive_rate.x)
+sex_differences <- sex_differences %>%
+  select(-TP, -FP, -TN, -FN, -TP.x, -FP.x, -TN.x, -FN.x, -true_positive_rate.x, -false_positive_rate.x)
+age_differences <- age_differences %>%
+  select(-TP, -FP, -TN, -FN, -TP.x, -FP.x, -TN.x, -FN.x, -true_positive_rate.x, -false_positive_rate.x)
+
+for (col in names(race_differences)) {
+  race_differences[[col]] <- replace(race_differences[[col]], is.infinite(race_differences[[col]]), NA)
+}
+for (col in names(sex_differences)) {
+  sex_differences[[col]] <- replace(sex_differences[[col]], is.infinite(sex_differences[[col]]), NA)
+}
+for (col in names(age_differences)) {
+  age_differences[[col]] <- replace(age_differences[[col]], is.infinite(age_differences[[col]]), NA)
+}
+
+race_single <- race_metrics_2 %>%
+  group_by(firm) %>%
+  filter(n() == 1) %>%
+  pull(firm)
+
+sex_single <- sex_metrics_2 %>%
+  group_by(firm) %>%
+  filter(n() == 1) %>%
+  pull(firm)
+
+age_single <- age_metrics_2 %>%
+  group_by(firm) %>%
+  filter(n() == 1) %>%
+  pull(firm)
+
+average_diff_race <- race_differences %>%
+  filter(firm %in% race_single) %>%
+  summarise(
+    average_acceptance_rate_diff = mean(race_acceptance_rate_diff, na.rm = TRUE),
+    average_true_positive_rate_diff = mean(race_true_positive_rate_diff, na.rm = TRUE),
+    average_false_positive_rate_diff = mean(race_false_positive_rate_diff, na.rm = TRUE),
+    average_AIR = mean(race_AIR, na.rm = TRUE)
+  )
+
+race_differences <- race_differences %>%
+  mutate(
+    race_acceptance_rate_diff = ifelse(firm %in% race_single, average_diff_race$average_acceptance_rate_diff, race_acceptance_rate_diff),
+    race_true_positive_rate_diff = ifelse(firm %in% race_single, average_diff_race$average_true_positive_rate_diff, race_true_positive_rate_diff),
+    race_false_positive_rate_diff = ifelse(firm %in% race_single, average_diff_race$average_false_positive_rate_diff, race_false_positive_rate_diff),
+    race_AIR = ifelse(firm %in% race_single, average_diff_race$average_AIR, race_AIR)
+  )
+
+average_diff_sex <- sex_differences %>%
+  filter(firm %in% sex_single) %>%
+  summarise(
+    average_acceptance_rate_diff = mean(sex_acceptance_rate_diff, na.rm = TRUE),
+    average_true_positive_rate_diff = mean(sex_true_positive_rate_diff, na.rm = TRUE),
+    average_false_positive_rate_diff = mean(sex_false_positive_rate_diff, na.rm = TRUE),
+    average_AIR = mean(sex_AIR, na.rm = TRUE)
+  )
+
+sex_differences <- sex_differences %>%
+  mutate(
+    sex_acceptance_rate_diff = ifelse(firm %in% sex_single, average_diff_sex$average_acceptance_rate_diff, sex_acceptance_rate_diff),
+    sex_true_positive_rate_diff = ifelse(firm %in% sex_single, average_diff_sex$average_true_positive_rate_diff, sex_true_positive_rate_diff),
+    sex_false_positive_rate_diff = ifelse(firm %in% sex_single, average_diff_sex$average_false_positive_rate_diff, sex_false_positive_rate_diff),
+    sex_AIR = ifelse(firm %in% sex_single, average_diff_sex$average_AIR, sex_AIR)
+  )
+
+average_diff_age <- age_differences %>%
+  filter(firm %in% age_single) %>%
+  summarise(
+    average_acceptance_rate_diff = mean(age_acceptance_rate_diff, na.rm = TRUE),
+    average_true_positive_rate_diff = mean(age_true_positive_rate_diff, na.rm = TRUE),
+    average_false_positive_rate_diff = mean(age_false_positive_rate_diff, na.rm = TRUE),
+    average_AIR = mean(age_AIR, na.rm = TRUE)
+  )
+
+age_differences <- age_differences %>%
+  mutate(
+    age_acceptance_rate_diff = ifelse(firm %in% age_single, average_diff_age$average_acceptance_rate_diff, age_acceptance_rate_diff),
+    age_true_positive_rate_diff = ifelse(firm %in% age_single, average_diff_age$average_true_positive_rate_diff, age_true_positive_rate_diff),
+    age_false_positive_rate_diff = ifelse(firm %in% age_single, average_diff_age$average_false_positive_rate_diff, age_false_positive_rate_diff),
+    age_AIR = ifelse(firm %in% age_single, average_diff_age$average_AIR, age_AIR)
+  )
+
+
+race_differences
+sex_differences
+age_differences
+
+# race_differences (differences in the following): acceptance rate, TPR, FPR
+# sex_differences (differences in the following): acceptance rate, TPR, FPR
+# age_differences (differences in the following): acceptance rate, TPR, FPR
+```
+
+## Merging the Above Data
+```{r}
+merged_data <- merge(firm_metrics, race_differences, by = "firm")
+merged_data <- merge(merged_data, sex_differences, by = "firm")
+merged_data <- merge(merged_data, age_differences, by = "firm")
+
+merged_data
+```
+
+## Averages of the differences of the 1000 Largest Firms' Origination rates, TPRs and FPRs
+```{r}
+avg_set <- merged_data %>%
+  mutate(
+    race_avg_act_diff = mean(race_acceptance_rate_diff),
+    race_avg_tpr_diff = mean(race_true_positive_rate_diff),
+    race_avg_air = mean(race_AIR, na.rm=T),
+    sex_avg_act_diff = mean(sex_acceptance_rate_diff),
+    sex_avg_tpr_diff = mean(sex_true_positive_rate_diff),
+    sex_avg_air = mean(sex_AIR, na.rm=T),
+    age_avg_act_diff = mean(age_acceptance_rate_diff),
+    age_avg_tpr_diff = mean(age_true_positive_rate_diff),
+    age_avg_air = mean(age_AIR, na.rm=T)
+  )
+avg_set
+```
+
+## Calculating Weighted Discrimination Scores
+```{r}
+merged_data$weighted_race_act <- merged_data$race_acceptance_rate_diff * (0.8643581/0.1085643)
+merged_data$weighted_sex_act <- merged_data$sex_acceptance_rate_diff * (0.970642/0.02230276)
+merged_data$weighted_age_act <- merged_data$age_acceptance_rate_diff * (0.9060489/0.07552546)
+
+merged_data$weighted_race_tpr <- merged_data$race_true_positive_rate_diff * (0.8643581/0.1063954)
+merged_data$weighted_sex_tpr <- merged_data$sex_true_positive_rate_diff * (0.970642/0.0213685)
+merged_data$weighted_age_tpr <- merged_data$age_true_positive_rate_diff * (0.9060489/0.07735714)
+
+merged_data$race_rating <- merged_data$weighted_race_act + merged_data$weighted_race_tpr + merged_data$race_AIR
+merged_data$sex_rating <- merged_data$weighted_sex_act + merged_data$weighted_sex_tpr + merged_data$sex_AIR
+merged_data$age_rating <- merged_data$weighted_age_act + merged_data$weighted_age_tpr + merged_data$age_AIR
+
+merged_data$race_scaled_rating = 1 - (rank(merged_data$race_rating, na.last = "keep") / sum(!is.na(merged_data$race_rating)))
+merged_data$sex_scaled_rating = 1 - (rank(merged_data$sex_rating, na.last = "keep") / sum(!is.na(merged_data$sex_rating)))
+merged_data$age_scaled_rating = 1 - (rank(merged_data$age_rating, na.last = "keep") / sum(!is.na(merged_data$age_rating)))
+
+race_min_rating <- min(merged_data$race_scaled_rating, na.rm = TRUE)
+race_max_rating <- max(merged_data$race_scaled_rating, na.rm = TRUE)
+sex_min_rating <- min(merged_data$sex_scaled_rating, na.rm = TRUE)
+sex_max_rating <- max(merged_data$sex_scaled_rating, na.rm = TRUE)
+age_min_rating <- min(merged_data$age_scaled_rating, na.rm = TRUE)
+age_max_rating <- max(merged_data$age_scaled_rating, na.rm = TRUE)
+
+merged_data$race_scaled_rating <- (merged_data$race_scaled_rating - race_min_rating) / (race_max_rating - race_min_rating)
+merged_data$sex_scaled_rating <- (merged_data$sex_scaled_rating - sex_min_rating) / (sex_max_rating - sex_min_rating)
+merged_data$age_scaled_rating <- (merged_data$age_scaled_rating - age_min_rating) / (age_max_rating - age_min_rating)
+
+merged_data$overall_rating <- merged_data$race_scaled_rating + merged_data$sex_scaled_rating + merged_data$age_scaled_rating
+
+overall_min_rating <- min(merged_data$overall_rating, na.rm = TRUE)
+overall_max_rating <- max(merged_data$overall_rating, na.rm = TRUE)
+
+merged_data$scaled_overall_rating <- (merged_data$overall_rating - overall_min_rating) / (overall_max_rating - overall_min_rating)
+
+merged_data <- merged_data[order(-merged_data$loan_applications, merged_data$firm), ]
+
+merged_data$firm_size_rank <- rank(-merged_data$loan_applications, ties.method = "min")
+
+ties <- which(duplicated(merged_data$loan_applications))
+for (i in ties) {
+  tied_firms <- merged_data$firm[merged_data$loan_applications == merged_data$loan_applications[i]]
+  tied_ranks <- merged_data$firm_size_rank[merged_data$loan_applications == merged_data$loan_applications[i]]
+  min_rank <- min(tied_ranks)
+  merged_data$firm_size_rank[merged_data$loan_applications == merged_data$loan_applications[i]] <- min_rank
+}
+
+merged_data
+```
+
+## Merging Some Variables from Two Different Dataframes
+```{r}
+merged_final <- merged_data %>%
+  subset(select = -c(race_rating, sex_rating, age_rating, overall_rating, weighted_age_act, weighted_race_act, weighted_sex_act, weighted_age_tpr, weighted_race_tpr, weighted_sex_tpr, age_false_positive_rate_diff, age_true_positive_rate_diff, sex_false_positive_rate_diff, sex_true_positive_rate_diff, race_false_positive_rate_diff, race_true_positive_rate_diff))
+
+merged_final$race_scaled_rating <- 100 * merged_final$race_scaled_rating
+merged_final$sex_scaled_rating <- 100 * merged_final$sex_scaled_rating
+merged_final$age_scaled_rating <- 100 * merged_final$age_scaled_rating
+merged_final$scaled_overall_rating <- 100 * merged_final$scaled_overall_rating
+
+df_everything <- merge(df_to_merge, merged_final, by = "firm", all.x = TRUE)
+df_everything
+```
+
+## Saving Final Dataset
+```{r}
+write.csv(df_everything, "path_to_final_df_csv.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# EVERYTHING BELOW THIS POINT DIDNT END UP BEING USED
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+Checking Loan Fairness Dsitributions 
+```{r}
+five_number_summary <- function(x) {
+  quantile(x, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+}
+
+columns_to_summarize <- c(
+  "equalized_odds_race", "equalized_odds_sex", "equalized_odds_age",
+  "race_true_positive_rate_diff", "sex_true_positive_rate_diff", "age_true_positive_rate_diff",
+  "race_acceptance_rate_diff", "sex_acceptance_rate_diff", "age_acceptance_rate_diff"
+)
+
+summary_stats <- merged_data %>%
+  summarise_at(
+    vars(columns_to_summarize), 
+    list(sum = ~sum(., na.rm = TRUE), mean = ~mean(., na.rm = TRUE))
+  )
+
+null_counts <- colSums(is.na(merged_data[, columns_to_summarize]))
+
+print(summary_stats)
+print(null_counts)
+```
+
+```{r}
+write.csv(merged_data, "C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\data_by_firm_csv_2.csv")
+```
+
+Merging Some Variables from Two Different Dataframes
+```{r}
+add_to_df_firm <- merged_data[, c("firm","age_scaled_rating", "sex_scaled_rating", "race_scaled_rating", "acceptance_rate", "loan_applications", "MinLoanApplications", "scaled_overall_rating")]
+
+df_firm <- merge(df_firm, add_to_df_firm, by = "firm", all.x = TRUE)
+df_firm
+```
+
+```{r}
+write.csv(df_firm, "C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\data_with_firm_names.csv")
+```
+
+
+#Demographic Parity by Sex
+
+##Filter to firms that have at least 100 loan applications by each sex category
+```{r}
+pair_counts <- table(df$lei, df$applicant_sex_cleaned)
+
+pair_counts_df <- as.data.frame.matrix(pair_counts)
+
+filtered_pair_counts_df <- pair_counts_df[rowSums(pair_counts_df >= 500) == ncol(pair_counts_df), ]
+
+filtered_pair_counts_df
+```
+
+##Create all sex lei pairs then filter by the condition above
+```{r}
+averages <- aggregate(loan_acceptance ~ lei + applicant_sex_cleaned, data = df, FUN = mean)
+
+lei_counts <- table(df$lei)
+
+lei_counts_df <- data.frame(lei = names(lei_counts), count = as.vector(lei_counts))
+
+result <- merge(averages, lei_counts_df, by = "lei")
+
+result$count[is.na(result$count)] <- 0
+
+names(result)[3] <- "loan_acceptance_rate"
+names(result)[4] <- "loan_applications"
+
+result <- result[order(result$loan_applications),]
+filtered_indexes <- rownames(filtered_pair_counts_df)
+
+filtered_result <- result[result$lei %in% filtered_indexes, ]
+
+filtered_result
+```
+
+##Demographic parity by financial institution which had 500 or more loan applications for each sex category in 2022
+```{r}
+dem_par <- filtered_result %>%
+  group_by(lei) %>%
+  summarise(
+    loan_applications = mean(loan_applications),
+    range_loan_acceptance_rate = max(loan_acceptance_rate, na.rm = TRUE) - min(loan_acceptance_rate, na.rm = TRUE),
+    variance_loan_acceptance_rate = sqrt(var(loan_acceptance_rate, na.rm = TRUE))
+  )
+
+dem_par <- dem_par[order(dem_par$range_loan_acceptance_rate), ]
+
+dem_par
+```
+
+##Looking into acceptance rates and applications numbers by race
+```{r}
+lei_filter <- "5493001SXWZ4OFP8Z903"
+filtered_df <- df[df$lei == lei_filter, ]
+
+sex_counts <- table(filtered_df$applicant_sex_cleaned)
+
+sex_counts
+
+filtered_result[filtered_result$lei == lei_filter,]
+```
+
+
+
+
+
+
+
+#Demographic Parity by Race
+
+##Filter to firms that have at least 30 loan applications by race category
+```{r}
+pair_counts <- table(df$lei, df$race)
+
+pair_counts_df <- as.data.frame.matrix(pair_counts)
+
+filtered_pair_counts_df <- pair_counts_df[rowSums(pair_counts_df >= 30) == ncol(pair_counts_df), ]
+
+filtered_pair_counts_df
+```
+
+##Create all race lei pairs then filter by the condition above
+```{r}
+averages <- aggregate(loan_acceptance ~ lei + race, data = df, FUN = mean)
+
+lei_counts <- table(df$lei)
+
+lei_counts_df <- data.frame(lei = names(lei_counts), count = as.vector(lei_counts))
+
+result <- merge(averages, lei_counts_df, by = "lei")
+
+result$count[is.na(result$count)] <- 0
+
+names(result)[3] <- "loan_acceptance_rate"
+names(result)[4] <- "loan_applications"
+
+result <- result[order(result$loan_applications),]
+filtered_indexes <- rownames(filtered_pair_counts_df)
+
+filtered_result <- result[result$lei %in% filtered_indexes, ]
+
+print(filtered_result)
+```
+
+
+
+##Demographic parity by financial institution which had 30 or more loan applications for each race category in 2022
+```{r}
+dem_par <- filtered_result %>%
+  group_by(lei) %>%
+  summarise(
+    loan_applications = mean(loan_applications),
+    range_loan_acceptance_rate = max(loan_acceptance_rate, na.rm = TRUE) - min(loan_acceptance_rate, na.rm = TRUE),
+    variance_loan_acceptance_rate = sqrt(var(loan_acceptance_rate, na.rm = TRUE))
+  )
+
+dem_par <- dem_par[order(dem_par$range_loan_acceptance_rate), ]
+
+dem_par
+```
+
+##Looking into acceptance rates and applications numbers by race
+```{r}
+lei_filter <- "549300MXJA09WZJ0DV55"
+filtered_df <- df[df$lei == lei_filter, ]
+
+race_counts <- table(filtered_df$race)
+
+print(race_counts)
+
+filtered_result[filtered_result$lei == lei_filter,]
+```
+
+
+
+
+#Demographic Parity by Age Group
+
+##Filter to firms that have at least 30 loan applications by race category
+```{r}
+pair_counts <- table(df$lei, df$applicant_age)
+
+pair_counts_df <- as.data.frame.matrix(pair_counts)
+
+filtered_pair_counts_df <- pair_counts_df[rowSums(pair_counts_df >= 30) == ncol(pair_counts_df), ]
+
+filtered_pair_counts_df
+```
+
+##Create all race lei pairs then filter by the condition above
+```{r}
+averages <- aggregate(loan_acceptance ~ lei + applicant_age, data = df, FUN = mean)
+
+lei_counts <- table(df$lei)
+
+lei_counts_df <- data.frame(lei = names(lei_counts), count = as.vector(lei_counts))
+
+result <- merge(averages, lei_counts_df, by = "lei")
+
+result$count[is.na(result$count)] <- 0
+
+names(result)[3] <- "loan_acceptance_rate"
+names(result)[4] <- "loan_applications"
+
+result <- result[order(result$loan_applications),]
+filtered_indexes <- rownames(filtered_pair_counts_df)
+
+filtered_result <- result[result$lei %in% filtered_indexes, ]
+
+print(filtered_result)
+```
+
+##Demographic parity by financial institution which had 30 or more loan applications for each race category in 2022
+```{r}
+dem_par <- filtered_result %>%
+  group_by(lei) %>%
+  summarise(
+    loan_applications = mean(loan_applications),
+    range_loan_acceptance_rate = max(loan_acceptance_rate, na.rm = TRUE) - min(loan_acceptance_rate, na.rm = TRUE),
+    stddev_loan_acceptance_rate = sqrt(var(loan_acceptance_rate, na.rm = TRUE))
+  )
+
+dem_par <- dem_par[order(dem_par$range_loan_acceptance_rate), ]
+
+dem_par
+```
+
+##Looking into acceptance rates and applications numbers by race
+```{r}
+lei_filter <- "549300HW662MN1WU8550"
+filtered_df <- df[df$lei == lei_filter, ]
+
+race_counts <- table(filtered_df$applicant_age)
+
+race_counts
+
+result_1 <- filtered_result[filtered_result$lei == lei_filter,]
+result_1 <- result_1[order(-result_1$loan_acceptance_rate),]
+result_1
+```
+
+Data Cleaning and Creation of the Sample Dataframe
+```{r}
+df <- df %>% mutate_all(~na_if(trimws(.), ""))
+
+df$loan_amount <- gsub("[$,]", "", df$loan_amount)
+
+df$loan_type <- as.integer(df$loan_type)
+df$action_taken <- as.integer(df$action_taken)
+df$purchaser_type <- as.integer(df$purchaser_type)
+df$loan_purpose <- as.integer(df$loan_purpose)
+df$loan_amount <- as.integer((df$loan_amount))
+df$interest_rate <- as.numeric(df$interest_rate)
+df$loan_term <- as.integer(df$loan_term)
+df$rate_spread <- as.numeric(df$rate_spread)
+df$total_loan_costs <- as.numeric(df$total_loan_costs)
+
+df <- subset(df, loan_type != 4)
+df <- df[df$action_taken %in% c(1, 2, 3), ]
+
+df$race <- ifelse(df$race %in% c("American Indian or Alaska Native", "Asian", "Native Hawaiian or Other Pacific Islander"), "Other", df$race)
+
+df$loan_acceptance <- ifelse(df$action_taken %in% c(1, 2), 1, ifelse(df$action_taken == 3, 0, NA))
+
+df$firm <- lei_to_firm[df$lei]
+
+df$apr <- (100*df$total_loan_costs) / df$loan_amount
+
+df$deserved_loan <- ifelse(is.na(df$apr), NA, ifelse(df$apr > 1.5, 1, 0))
+
+df
+```
+
+
+```{r}
+get_firm_name <- function(lei) {
+  url <- paste0("https://www.lei-lookup.com/record/", lei, "/")
+  
+  page <- read_html(url)
+  
+  firm_name <- page %>% html_nodes('h1') %>% html_text()
+  
+  return(firm_name)
+}
+
+unique_leis <- unique(df$lei)
+
+firm_names <- sapply(unique_leis, get_firm_name)
+
+lei_firm_pairs <- setNames(firm_names, unique_leis)
+
+df$firm <- lei_firm_pairs[df$lei]
+
+df
+```
+
+```{r}
+df <- df %>%
+  mutate(loan_type_desc = case_when(
+    loan_type == 1 ~ "Conventional",
+    loan_type == 2 ~ "FHA-insured",
+    loan_type == 3 ~ "VA-guaranteed",
+    loan_type == 4 ~ "FSA/RHS",
+    TRUE ~ NA_character_  
+  ))
+
+df <- df %>%
+  mutate(race_ethnicity = case_when(
+    applicant_ethnicity_1 == 1 ~ "Hispanic or Latino",
+    applicant_race_1 %in% c(1, 4) ~ "Other",
+    applicant_race_1 == 2 ~ "Asian",
+    applicant_race_1 == 3 ~ "Black",
+    applicant_race_1 == 5 ~ "White",
+    TRUE ~ NA_character_  
+  ))
+```
+
+```{r}
+write.csv(df, "C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\data_with_firm_names.csv")
+```
+
+Running Random Forest Regression to get an Indicator for whether a Loan "should have" been Given
+```{r}
+df_firm <- read.csv("C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\data_with_firm_names.csv")
+
+df_firm$debt_to_income_ratio_cleaned <- gsub("50%-60%", "50-60%", df_firm$debt_to_income_ratio_cleaned)
+
+df_firm$debt_to_income_ratio_cleaned <- as.factor(df_firm$debt_to_income_ratio_cleaned)
+df_firm$loan_type_desc <- as.factor(df_firm$loan_type_desc)
+
+df_firm$income <- gsub("[$,]", "", df_firm$income)
+
+df_firm$income <- as.numeric(df_firm$income)
+df_firm$loan_amount <- as.integer(df_firm$loan_amount)
+df_firm$income_to_loan_ratio <- df_firm$income / df_firm$loan_amount
+
+df_firm$coapplicant_cleaned <- ifelse(df_firm$coapplicant == "Yes", 1, ifelse(df_firm$coapplicant == "No", 0, NA))
+
+df_firm$loan_acceptance <- as.factor(df_firm$loan_acceptance)
+
+df_firm$loan_type_conventional <- ifelse(df_firm$loan_type_desc == "Conventional", 1, 0)
+df_firm$loan_type_FHA_insured <- ifelse(df_firm$loan_type_desc == "FHA-insured", 1, 0)
+
+df_firm$dto_ratio_0_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "0%", 1, 0)
+df_firm$dto_ratio_0_20_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "0-20%", 1, 0)
+df_firm$dto_ratio_20_30_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "20-30%", 1, 0)
+df_firm$dto_ratio_30_40_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "30-40%", 1, 0)
+df_firm$dto_ratio_40_50_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "40-50%", 1, 0)
+df_firm$dto_ratio_50_60_percent <- ifelse(df_firm$debt_to_income_ratio_cleaned == "50-60%", 1, 0)
+
+df_firm
+```
+
+```{r}
+predictors <- df_firm[, c('loan_acceptance', 'coapplicant_cleaned', 'loan_term', 'income', 'income_to_loan_ratio', 'loan_type_FHA_insured', 'loan_type_conventional', 'dto_ratio_0_percent', 'dto_ratio_0_20_percent', 'dto_ratio_20_30_percent', 'dto_ratio_30_40_percent', 'dto_ratio_40_50_percent', 'dto_ratio_50_60_percent')]
+
+complete_rows <- complete.cases(predictors)
+
+df_firm <- df_firm[complete_rows, ]
+predictors <- predictors[complete_rows, ]
+
+vif_results <- vif(lm(loan_acceptance ~ ., data = predictors)) 
+#No multicollinearity issues
+
+rf_model <- randomForest(loan_acceptance ~ ., data = predictors, ntree = 100, importance = TRUE)
+
+predicted_values <- predict(rf_model, newdata = df_firm)
+
+df_firm$predicted_loan_acceptance <- predicted_values
+
+varImpPlot(rf_model)
+```
+
+```{r}
+table(df_firm$loan_acceptance, df_firm$predicted_loan_acceptance)
+```
+
+```{r}
+write.csv(df_firm, "C:\\Users\\ggoss\\OneDrive - FI Consulting\\Gray\\Intern Work\\Loan Fairness Project\\Data\\data_with_firms_and_predicted_responses.csv")
+```
+
+
+
+
+Creating New Dataframe (Statistics for each Firm Collectively)
+```{r}
+null_counts <- sapply(predictors, function(x) sum(is.na(x)))
+
+complete_rows <- sum(complete.cases(predictors))
+
+total_rows <- nrow(predictors)
+
+null_counts
+
+paste("Number of rows with no null values:", complete_rows)
+paste("Total number of rows:", total_rows)
+```
+
+```{r}
+df_firm_analysis <- df_firm[, c("loan_acceptance", "predicted_loan_acceptance", "firm", "race_ethnicity", "applicant_age", "applicant_sex_cleaned")]
+
+df_firm_analysis <- na.omit(df_firm_analysis)
+
+rownames(df_firm_analysis) <- NULL
+
+df_firm_analysis
+```
+
+```{r}
+df_firm_analysis$predicted_loan_acceptance <- as.integer(as.factor(df_firm_analysis$predicted_loan_acceptance)) -1
+df_firm_analysis$loan_acceptance <- as.integer(as.factor(df_firm_analysis$loan_acceptance)) -1
+
+firm_counts <- table(df_firm_analysis$firm)
+
+firm_acceptance_rates <- tapply(df_firm_analysis$loan_acceptance, df_firm_analysis$firm, function(x) mean(x))
+
+firm_metrics <- data.frame(
+  firm = names(firm_counts),
+  loan_applications = as.numeric(firm_counts),
+  acceptance_rate = firm_acceptance_rates
+)
+
+firm_metrics
+```
+
+```{r}
+df_firm_analysis$predicted_loan_acceptance <- as.integer(as.factor(df_firm_analysis$predicted_loan_acceptance)) -1
+df_firm_analysis$loan_acceptance <- as.integer(as.factor(df_firm_analysis$loan_acceptance)) -1
+
+race_grouped <- df_firm_analysis %>%
+  group_by(firm, race_ethnicity)
+
+race_metrics <- race_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = mean(loan_acceptance & predicted_loan_acceptance),
+    false_positive_rate = mean(!loan_acceptance & predicted_loan_acceptance)
+  )
+
+sex_grouped <- df_firm_analysis %>%
+  group_by(firm, applicant_sex_cleaned)
+
+sex_metrics <- sex_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = mean(loan_acceptance & predicted_loan_acceptance),
+    false_positive_rate = mean(!loan_acceptance & predicted_loan_acceptance)
+  )
+
+age_grouped <- df_firm_analysis %>%
+  group_by(firm, applicant_age)
+
+age_metrics <- age_grouped %>%
+  summarise(
+    loan_applications = n(),
+    acceptance_rate = mean(loan_acceptance),
+    true_positive_rate = mean(loan_acceptance & predicted_loan_acceptance),
+    false_positive_rate = mean(!loan_acceptance & predicted_loan_acceptance)
+  )
+
+race_metrics
+sex_metric
+age_metrics
+
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and loan_applications
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and acceptance_rate
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and true_positive_rate
+# age_metrics: applicant_age (24 or younger, 25-34, 35-44, 45-54, 55-64, 65-74, 75 or older) and false_positive_rate
+
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and loan_applications
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and acceptance_rate
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and true_positive_rate
+# race_metrics: race_ethnicity (Asian, Black, Hispanic or Latino, Other, White) and false_positive_rate
+
+# sex_metrics: applicant_sex_cleaned (Female, Male) and loan_applications
+# sex_metrics: applicant_sex_cleaned (Female, Male) and acceptance_rate
+# sex_metrics: applicant_sex_cleaned (Female, Male) and true_positive_rate
+# sex_metrics: applicant_sex_cleaned (Female, Male) and false_positive_rate
+```
+
+
+step 3
+```{r}
+df_firm_analysis$predicted_loan_acceptance <- as.integer(as.factor(df_firm_analysis$predicted_loan_acceptance)) -1
+df_firm_analysis$loan_acceptance <- as.integer(as.factor(df_firm_analysis$loan_acceptance)) -1
+
+calculate_metrics <- function(df, group_col) {
+  grouped_df <- df %>%
+    group_by(firm, {{group_col}})
+
+  demographic_metrics <- grouped_df %>%
+    summarise(
+      acceptance_rate = mean(loan_acceptance),
+      TP = sum(predicted_loan_acceptance == 1 & loan_acceptance == 1),
+      FN = sum(predicted_loan_acceptance == 1 & loan_acceptance == 0),
+
+      true_positive_rate = TP / (TP + FN),
+      
+      FP = sum(predicted_loan_acceptance == 0 & loan_acceptance == 1),
+      TN = sum(predicted_loan_acceptance == 0 & loan_acceptance == 0),
+
+      false_positive_rate = FP / (FP + TN)
+    )
+  
+  return(demographic_metrics)
+}
+
+race_metrics_2 <- calculate_metrics(df_firm_analysis, race_ethnicity)
+
+sex_metrics_2 <- calculate_metrics(df_firm_analysis, applicant_sex_cleaned)
+
+age_metrics_2 <- calculate_metrics(df_firm_analysis, applicant_age)
+
+calculate_differences <- function(metrics) {
+  metrics_subset <- metrics[, -(1:2)]
+  
+  max_values <- sapply(metrics_subset, function(x) tapply(x, metrics$firm, max, na.rm = TRUE))
+  min_values <- sapply(metrics_subset, function(x) tapply(x, metrics$firm, min, na.rm = TRUE))
+  
+  max_df <- as.data.frame(max_values)
+  min_df <- as.data.frame(min_values)
+  
+  differences <- max_df - min_df
+  return(differences)
+}
+
+race_differences <- calculate_differences(race_metrics_2)
+sex_differences <- calculate_differences(sex_metrics_2)
+age_differences <- calculate_differences(age_metrics_2)
+
+colnames(race_differences)[colnames(race_differences) == "acceptance_rate"] <- "race_acceptance_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "acceptance_rate"] <- "sex_acceptance_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "acceptance_rate"] <- "age_acceptance_rate_diff"
+
+colnames(race_differences)[colnames(race_differences) == "true_positive_rate"] <- "race_true_positive_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "true_positive_rate"] <- "sex_true_positive_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "true_positive_rate"] <- "age_true_positive_rate_diff"
+
+colnames(race_differences)[colnames(race_differences) == "false_positive_rate"] <- "race_false_positive_rate_diff"
+colnames(sex_differences)[colnames(sex_differences) == "false_positive_rate"] <- "sex_false_positive_rate_diff"
+colnames(age_differences)[colnames(age_differences) == "false_positive_rate"] <- "age_false_positive_rate_diff"
+
+race_differences$firm <- rownames(race_differences)
+sex_differences$firm <- rownames(sex_differences)
+age_differences$firm <- rownames(age_differences)
+
+race_differences <- race_differences %>%
+  select(-TP, -FP, -TN, -FN)
+sex_differences <- sex_differences %>%
+  select(-TP, -FP, -TN, -FN)
+age_differences <- age_differences %>%
+  select(-TP, -FP, -TN, -FN)
+
+for (col in names(race_differences)) {
+  race_differences[[col]] <- replace(race_differences[[col]], is.infinite(race_differences[[col]]), NA)
+}
+for (col in names(sex_differences)) {
+  sex_differences[[col]] <- replace(sex_differences[[col]], is.infinite(sex_differences[[col]]), NA)
+}
+for (col in names(age_differences)) {
+  age_differences[[col]] <- replace(age_differences[[col]], is.infinite(age_differences[[col]]), NA)
+}
+
+race_differences
+sex_differences
+age_differences
+
+# race_differences (differences in the following): acceptance rate, TPR, FPR
+# sex_differences (differences in the following): acceptance rate, TPR, FPR
+# age_differences (differences in the following): acceptance rate, TPR, FPR
+```
+
+step 4
+```{r}
+merged_data <- merge(firm_metrics, race_differences, by = "firm")
+merged_data <- merge(merged_data, sex_differences, by = "firm")
+merged_data <- merge(merged_data, age_differences, by = "firm")
+
+merged_data
+```
+
+
+step 5
+```{r}
+age_24_or_younger <- age_metrics %>%
+  filter(applicant_age == "24 or younger") %>%
+  rename(firm = firm, 
+         loan_applications_24_or_younger = loan_applications,
+         acceptance_rate_24_or_younger = acceptance_rate,
+         true_positive_rate_24_or_younger = true_positive_rate,
+         false_positive_rate_24_or_younger = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_25_34 <- age_metrics %>%
+  filter(applicant_age == "25-34") %>%
+  rename(firm = firm, 
+         loan_applications_25_34 = loan_applications,
+         acceptance_rate_25_34 = acceptance_rate,
+         true_positive_rate_25_34 = true_positive_rate,
+         false_positive_rate_25_34 = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_35_44 <- age_metrics %>%
+  filter(applicant_age == "35-44") %>%
+  rename(firm = firm, 
+         loan_applications_35_44 = loan_applications,
+         acceptance_rate_35_44 = acceptance_rate,
+         true_positive_rate_35_44 = true_positive_rate,
+         false_positive_rate_35_44 = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_45_54 <- age_metrics %>%
+  filter(applicant_age == "45-54") %>%
+  rename(firm = firm, 
+         loan_applications_45_54 = loan_applications,
+         acceptance_rate_45_54 = acceptance_rate,
+         true_positive_rate_45_54 = true_positive_rate,
+         false_positive_rate_45_54 = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_55_64 <- age_metrics %>%
+  filter(applicant_age == "55-64") %>%
+  rename(firm = firm, 
+         loan_applications_55_64 = loan_applications,
+         acceptance_rate_55_64 = acceptance_rate,
+         true_positive_rate_55_64 = true_positive_rate,
+         false_positive_rate_55_64 = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_65_74 <- age_metrics %>%
+  filter(applicant_age == "65-74") %>%
+  rename(firm = firm, 
+         loan_applications_65_74 = loan_applications,
+         acceptance_rate_65_74 = acceptance_rate,
+         true_positive_rate_65_74 = true_positive_rate,
+         false_positive_rate_65_74 = false_positive_rate) %>%
+  select(-applicant_age)
+
+age_75_or_older <- age_metrics %>%
+  filter(applicant_age == "75 or older") %>%
+  rename(firm = firm, 
+         loan_applications_75_or_older = loan_applications,
+         acceptance_rate_75_or_older = acceptance_rate,
+         true_positive_rate_75_or_older = true_positive_rate,
+         false_positive_rate_75_or_older = false_positive_rate) %>%
+  select(-applicant_age)
+
+sex_male <- sex_metrics %>%
+  filter(applicant_sex_cleaned == "Male") %>%
+  rename(firm = firm, 
+         loan_applications_Male = loan_applications,
+         acceptance_rate_Male = acceptance_rate,
+         true_positive_rate_Male = true_positive_rate,
+         false_positive_rate_Male = false_positive_rate) %>%
+  select(-applicant_sex_cleaned)
+
+sex_female <- sex_metrics %>%
+  filter(applicant_sex_cleaned == "Female") %>%
+  rename(firm = firm, 
+         loan_applications_Female = loan_applications,
+         acceptance_rate_Female = acceptance_rate,
+         true_positive_rate_Female = true_positive_rate,
+         false_positive_rate_Female = false_positive_rate) %>%
+  select(-applicant_sex_cleaned)
+
+race_asian <- race_metrics %>%
+  filter(race_ethnicity == "Asian") %>%
+  rename(firm = firm, 
+         loan_applications_Asian = loan_applications,
+         acceptance_rate_Asian = acceptance_rate,
+         true_positive_rate_Asian = true_positive_rate,
+         false_positive_rate_Asian = false_positive_rate) %>%
+  select(-race_ethnicity)
+
+race_black <- race_metrics %>%
+  filter(race_ethnicity == "Black") %>%
+  rename(firm = firm, 
+         loan_applications_Black = loan_applications,
+         acceptance_rate_Black = acceptance_rate,
+         true_positive_rate_Black = true_positive_rate,
+         false_positive_rate_Black = false_positive_rate) %>%
+  select(-race_ethnicity)
+
+race_hispanic <- race_metrics %>%
+  filter(race_ethnicity == "Hispanic or Latino") %>%
+  rename(firm = firm, 
+         loan_applications_Hispanic_or_Latino = loan_applications,
+         acceptance_rate_Hispanic_or_Latino = acceptance_rate,
+         true_positive_rate_Hispanic_or_Latino = true_positive_rate,
+         false_positive_rate_Hispanic_or_Latino = false_positive_rate) %>%
+  select(-race_ethnicity)
+
+race_other <- race_metrics %>%
+  filter(race_ethnicity == "Other") %>%
+  rename(firm = firm, 
+         loan_applications_Other = loan_applications,
+         acceptance_rate_Other = acceptance_rate,
+         true_positive_rate_Other = true_positive_rate,
+         false_positive_rate_Other = false_positive_rate) %>%
+  select(-race_ethnicity)
+
+race_white <- race_metrics %>%
+  filter(race_ethnicity == "White") %>%
+  rename(firm = firm, 
+         loan_applications_White = loan_applications,
+         acceptance_rate_White = acceptance_rate,
+         true_positive_rate_White = true_positive_rate,
+         false_positive_rate_White = false_positive_rate) %>%
+  select(-race_ethnicity)
+
+merged_data_1 <- merge(age_24_or_younger, age_25_34, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, age_35_44, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, age_45_54, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, age_55_64, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, age_65_74, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, age_75_or_older, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, sex_male, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, sex_female, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, race_asian, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, race_black, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, race_hispanic, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, race_other, by = "firm", all = TRUE)
+merged_data_1 <- merge(merged_data_1, race_white, by = "firm", all = TRUE)
+
+merged_data <- merge(merged_data, merged_data_1, by = "firm", all = TRUE)
+
+merged_data$equalized_odds_race <- merged_data$race_true_positive_rate_diff + merged_data$race_false_positive_rate_diff
+merged_data$equalized_odds_sex <- merged_data$sex_true_positive_rate_diff + merged_data$sex_false_positive_rate_diff
+merged_data$equalized_odds_age <- merged_data$age_true_positive_rate_diff + merged_data$age_false_positive_rate_diff
+
+merged_data$race_weighted_acceptance_rate_diff <- 0.7146926 * merged_data$race_acceptance_rate_diff
+merged_data$sex_weighted_acceptance_rate_diff <- 0.7406496 * merged_data$sex_acceptance_rate_diff
+merged_data$age_weighted_acceptance_rate_diff <- 0.7340621 * merged_data$age_acceptance_rate_diff
+
+merged_data$race_rating <- merged_data$race_weighted_acceptance_rate_diff + merged_data$race_true_positive_rate_diff
+merged_data$sex_rating <- merged_data$sex_weighted_acceptance_rate_diff + merged_data$sex_true_positive_rate_diff
+merged_data$age_rating <- merged_data$age_weighted_acceptance_rate_diff + merged_data$age_true_positive_rate_diff
+
+merged_data$race_scaled_rating = 1 - (rank(merged_data$race_rating, na.last = "keep") / sum(!is.na(merged_data$race_rating)))
+merged_data$sex_scaled_rating = 1 - (rank(merged_data$sex_rating, na.last = "keep") / sum(!is.na(merged_data$sex_rating)))
+merged_data$age_scaled_rating = 1 - (rank(merged_data$age_rating, na.last = "keep") / sum(!is.na(merged_data$age_rating)))
+
+race_min_rating <- min(merged_data$race_scaled_rating, na.rm = TRUE)
+race_max_rating <- max(merged_data$race_scaled_rating, na.rm = TRUE)
+sex_min_rating <- min(merged_data$sex_scaled_rating, na.rm = TRUE)
+sex_max_rating <- max(merged_data$sex_scaled_rating, na.rm = TRUE)
+age_min_rating <- min(merged_data$age_scaled_rating, na.rm = TRUE)
+age_max_rating <- max(merged_data$age_scaled_rating, na.rm = TRUE)
+
+merged_data$race_scaled_rating <- (merged_data$race_scaled_rating - race_min_rating) / (race_max_rating - race_min_rating)
+merged_data$sex_scaled_rating <- (merged_data$sex_scaled_rating - sex_min_rating) / (sex_max_rating - sex_min_rating)
+merged_data$age_scaled_rating <- (merged_data$age_scaled_rating - age_min_rating) / (age_max_rating - age_min_rating)
+
+merged_data$overall_rating <- merged_data$race_scaled_rating + merged_data$sex_scaled_rating + merged_data$age_scaled_rating
+
+overall_min_rating <- min(merged_data$overall_rating, na.rm = TRUE)
+overall_max_rating <- max(merged_data$overall_rating, na.rm = TRUE)
+
+merged_data$scaled_overall_rating <- (merged_data$overall_rating - overall_min_rating) / (overall_max_rating - overall_min_rating)
+
+merged_data <- merged_data %>%
+  mutate_at(
+    vars(
+      loan_applications_Asian,
+      loan_applications_Black,
+      loan_applications_Hispanic_or_Latino,
+      loan_applications_Other,
+      loan_applications_White,
+      loan_applications_Female,
+      loan_applications_Male,
+      loan_applications_24_or_younger,
+      loan_applications_25_34,
+      loan_applications_35_44,
+      loan_applications_45_54,
+      loan_applications_55_64,
+      loan_applications_65_74,
+      loan_applications_75_or_older
+    ),
+    ~ifelse(is.na(.), 0, .)
+  )
+
+merged_data <- merged_data %>%
+  rowwise() %>%
+  mutate(MinLoanApplications = min(c(
+    loan_applications_Asian,
+    loan_applications_Black,
+    loan_applications_Hispanic_or_Latino,
+    loan_applications_Other,
+    loan_applications_White,
+    loan_applications_Female,
+    loan_applications_Male,
+    loan_applications_24_or_younger,
+    loan_applications_25_34,
+    loan_applications_35_44,
+    loan_applications_45_54,
+    loan_applications_55_64,
+    loan_applications_65_74,
+    loan_applications_75_or_older
+  ), na.rm = TRUE))
+
+merged_data
+```
