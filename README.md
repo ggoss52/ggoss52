@@ -1,5 +1,5 @@
 - Hi, I’m Gray
-- I have experience in R, Python, SAS, SQL, and PowerBI
+- I have coding experience in R, Python, SAS, SQL, and Stata
 - I am currently working as an analyst at FI Consulting
 - If you want to contact me, email me at graygoss52@gmail.com
 
